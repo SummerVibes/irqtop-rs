@@ -5,14 +5,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::result::Result::Ok;
-/// 中断统计数据结构
+/// Interrupt statistics
 #[derive(Debug, Default, Clone)]
 struct IrqStats {
     counts: Vec<u64>,
     name: String,
 }
 
-/// 命令行参数解析
+/// Paurse command-line arguments
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -30,7 +30,7 @@ enum Commands {
     Show { irq_name: String },
 }
 
-/// 读取/proc/interrupts文件
+/// read /proc/interrupts
 fn read_interrupts() -> Result<HashMap<String, IrqStats>> {
     let content = fs::read_to_string("/proc/interrupts")?;
     let mut irq_map = HashMap::new();
@@ -81,8 +81,6 @@ fn read_interrupts() -> Result<HashMap<String, IrqStats>> {
     Ok(irq_map)
 }
 
-
-/// 计算两次中断计数的差值
 fn calculate_delta(old: &HashMap<String, IrqStats>, new: &HashMap<String, IrqStats>) -> HashMap<String, u64> {
     let mut deltas = HashMap::new();
     for (irq, new_stats) in new {
@@ -136,6 +134,7 @@ fn get_effective_affinity_map() -> HashMap<String, String> {
 
 /// Display combined delta and affinity information
 fn show_combined_stats(deltas: &HashMap<String, u64>) {
+    print!("\x1B[?1049h");
     let mut sorted: Vec<_> = deltas.iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(a.1));
 
@@ -143,7 +142,7 @@ fn show_combined_stats(deltas: &HashMap<String, u64>) {
     let (width, height) = term_size::dimensions().unwrap_or((80, 100));
     let max_rows = (height - 4).max(1); // Reserve 4 lines for headers
     
-    println!("\x1B[2J\x1B[H"); // Clear screen
+    print!("\x1B[0J");
     println!("Real-time Interrupt Statistics with Affinity");
 
     let interrupts = read_interrupts().unwrap();
@@ -169,13 +168,11 @@ fn show_combined_stats(deltas: &HashMap<String, u64>) {
     }
 }
 
-/// 显示CPU中断delta统计
+/// Display combined delta and affinity information
 fn show_cpu_stats(irq_name: &str) -> Result<()> {
-    // 使用线程安全的存储方案
     use std::sync::Mutex;
     use std::sync::OnceLock;
     
-    // 全局状态存储
     static PREV_STATS: OnceLock<Mutex<Option<IrqStats>>> = OnceLock::new();
     let prev_stats = PREV_STATS.get_or_init(|| Mutex::new(None));
     
@@ -183,7 +180,6 @@ fn show_cpu_stats(irq_name: &str) -> Result<()> {
         .with_context(|| format!("IRQ {} not found", irq_name))?;
     let cloned_stats = curr_stats.clone();
     
-    // 计算delta值（自动加锁）
     let deltas = prev_stats.lock()
         .unwrap()
         .as_ref()
@@ -194,27 +190,40 @@ fn show_cpu_stats(irq_name: &str) -> Result<()> {
                 .collect::<Vec<u64>>()
         });
 
-    // 更新前一次统计（自动解锁）
     *prev_stats.lock().unwrap() = Some(cloned_stats);
 
-    println!("\x1B[2J\x1B[H"); // 清屏
+    println!("\x1B[2J\x1B[H");
     println!("CPU Delta Statistics for {}:", irq_name);
     println!("{:<8} {:<16}", "CPU", "Δ/s");
 
-    // 创建带索引的delta列表并排序
     let counts_len = curr_stats.counts.len();
-    let mut sorted_deltas: Vec<_> = deltas.unwrap_or_else(|| vec![0; counts_len])        .into_iter()
+    let deltas: Vec<_> = deltas.unwrap_or_else(|| vec![0; counts_len])        .into_iter()
         .enumerate()
         .collect();
     
-    sorted_deltas.sort_by(|a, b| b.1.cmp(&a.1)); // 降序排序
+    // Get terminal dimensions
+    let (term_width, term_height) = term_size::dimensions().unwrap_or((80, 24));
+    let max_cpu_per_col = (term_height - 4).max(1) as usize; // Reserve 4 lines for headers
+    let num_columns = (deltas.len() as f32 / max_cpu_per_col as f32).ceil() as usize;
+    let col_width = 20; // 8 for "CPU" column
+    
+    // Print header
+    println!("\nInterrupt: {:<8}", irq_name);
+    for col in 0..num_columns {
+        print!("{:<width$}", format!("Δ/s (Col {})", col+1), width = col_width);
+    }
+    println!("\n{}", "-".repeat(term_width as usize));
 
-    // 输出排序后的结果
-    for (i, delta) in sorted_deltas {
-        if i % 64 == 0 && i != 0 {
-            println!();
+    // Print CPU deltas in columns
+    for row in 0..max_cpu_per_col {
+        for col in 0..num_columns {
+            let idx = row + col * max_cpu_per_col;
+            if let Some((cpu, delta)) = deltas.get(idx) {
+                print!("{:<8} ", cpu);
+                print!("{:<width$}", delta, width = col_width-8);
+            }
         }
-        println!("{:<8} {:<16}", i, delta);
+        println!();
     }
     
     Ok(())
