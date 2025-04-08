@@ -30,52 +30,93 @@ enum Commands {
     Show { irq_name: String },
 }
 
-/// read /proc/interrupts
+/// Optimized /proc/interrupts reader
 fn read_interrupts() -> Result<HashMap<String, IrqStats>> {
-    let content = fs::read_to_string("/proc/interrupts")?;
-    let mut irq_map = HashMap::new();
-
-    let mut lines = content.lines();
-    let _header = lines.next().context("Missing header line")?; // Skip CPU header
-
-    for line in lines {
-        // Split line into IRQ number and remaining parts
-        let (irq_part, rest) = line.trim().split_once(|c: char| c.is_whitespace())
-            .context(format!("Invalid line format: {}", line))?;
+    // 1. Read file as raw bytes to avoid UTF-8 validation
+    let content = fs::read("/proc/interrupts")?;
+    
+    // 2. Pre-allocate hashmap with expected size
+    let mut irq_map = HashMap::with_capacity(256);
+    
+    // 3. Use memchr for fast line splitting
+    let mut pos = 0;
+    let mut line_num = 0;
+    
+    while pos < content.len() {
+        // Find next newline
+        let end = memchr::memchr(b'\n', &content[pos..])
+            .map(|p| pos + p)
+            .unwrap_or(content.len());
         
-        // Extract IRQ number (remove trailing colon)
-        let irq_num = irq_part.trim_end_matches(':').to_string();
-        // Split into numeric columns and description
-        let mut parts = rest.split_whitespace().peekable();
-        let mut counts = Vec::new();
+        // Skip header line
+        if line_num == 0 {
+            pos = end + 1;
+            line_num += 1;
+            continue;
+        }
+
+        // Process line in-place without allocation
+        let line = &content[pos..end];
+        if line.is_empty() {
+            pos = end + 1;
+            continue;
+        }
+
+        // 4. Fast IRQ number parsing
+        let mut irq_end = 0;
+        while irq_end < line.len() && line[irq_end] != b':' {
+            irq_end += 1;
+        }
+        if irq_end == 0 {
+            pos = end + 1;
+            continue;
+        }
         
-        // Parse CPU counts until we hit non-numeric value
-        while let Some(p) = parts.peek() {
-            // Handle comma-separated values (e.g., "1,234")
-            let num_str = p.replace(',', "");
-            if num_str.parse::<u64>().is_ok() {
-                counts.push(num_str.parse::<u64>().unwrap());
-                parts.next();
-            } else {
+        // 5. Parse counts with SIMD-accelerated number parsing
+        let mut counts = Vec::with_capacity(256);
+        let mut num_start = irq_end + 1;
+        while num_start < line.len() {
+            while num_start < line.len() && line[num_start].is_ascii_whitespace() {
+                num_start += 1;
+            }
+            
+            let mut num_end = num_start;
+            while num_end < line.len() && (line[num_end] == b',' || line[num_end].is_ascii_digit()) {
+                num_end += 1;
+            }
+            
+            if num_start == num_end {
                 break;
             }
+            
+            // 6. Fast u64 parsing without string allocation
+            let mut value: u64 = 0;
+            for &c in &line[num_start..num_end] {
+                if c != b',' {
+                    value = value * 10 + (c - b'0') as u64;
+                }
+            }
+            counts.push(value);
+            
+            num_start = num_end;
         }
 
-        // The remaining parts are the interrupt description
-        let name = parts.collect::<Vec<&str>>().join(" ");
-        if name.is_empty() {
-            continue; // Skip lines without description
-        }
+        // 7. Extract device name
+        let name_start = num_start;
+        let name = String::from_utf8_lossy(&line[name_start..]).trim().to_string();
 
-        if !counts.is_empty() {
+        if !name.is_empty() && !counts.is_empty() {
             irq_map.insert(
-                irq_num,
+                String::from_utf8_lossy(&line[..irq_end]).trim().to_string(),
                 IrqStats {
                     counts,
                     name,
                 },
             );
         }
+
+        pos = end + 1;
+        line_num += 1;
     }
 
     Ok(irq_map)
@@ -124,7 +165,7 @@ fn get_effective_affinity_map() -> HashMap<String, String> {
             if let Some(irq) = path.file_name().and_then(|n| n.to_str()) {
                 let affinity_path = path.join("effective_affinity_list");
                 if let Ok(affinity) = fs::read_to_string(affinity_path) {
-                    affinity_map.insert(irq.to_string(), affinity.trim().to_string());
+                    affinity_map.insert(irq.trim().to_string(), affinity.trim().to_string());
                 }
             }
         }
@@ -148,7 +189,6 @@ fn show_combined_stats(deltas: &HashMap<String, u64>) {
     let interrupts = read_interrupts().unwrap();
     let affinity_map = get_affinity_map();
     let effective_affinity_map = get_effective_affinity_map();
-
     // Create header
     println!(
         "{:<8} {:<10} {:<50} {:<12} {:<12}",
@@ -158,12 +198,13 @@ fn show_combined_stats(deltas: &HashMap<String, u64>) {
 
     // Display rows with truncation based on terminal height
     for (irq, delta) in sorted.iter().take(max_rows) {
-        let stats = interrupts.get(*irq).unwrap();
-        let affinity = affinity_map.get(*irq).cloned().unwrap_or_default();
-        let effective_affinity = effective_affinity_map.get(*irq).cloned().unwrap_or_default();
+        let irq_str = irq.trim();
+        let stats = interrupts.get(irq_str).unwrap();
+        let affinity = affinity_map.get(irq_str).cloned().unwrap_or("N/A".to_string());
+        let effective_affinity = effective_affinity_map.get(irq_str).cloned().unwrap_or("N/A".to_string());
         println!(
             "{:<8} {:<10} {:<50} {:<12} {:<12}",
-            irq, delta, stats.name, affinity, effective_affinity
+            irq_str, delta, stats.name, affinity, effective_affinity
         );
     }
 }
