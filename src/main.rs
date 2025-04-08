@@ -180,7 +180,7 @@ fn show_combined_stats(deltas: &HashMap<String, u64>) {
     sorted.sort_by(|a, b| b.1.cmp(a.1));
 
     // Get terminal dimensions
-    let (width, height) = term_size::dimensions().unwrap_or((80, 100));
+    let (width, height) = term_size::dimensions().unwrap_or((80, 120));
     let max_rows = (height - 4).max(1); // Reserve 4 lines for headers
     
     print!("\x1B[0J");
@@ -189,10 +189,10 @@ fn show_combined_stats(deltas: &HashMap<String, u64>) {
     let interrupts = read_interrupts().unwrap();
     let affinity_map = get_affinity_map();
     let effective_affinity_map = get_effective_affinity_map();
-    // Create header
+    // Create header, EAffinity means Effective Affinity
     println!(
-        "{:<8} {:<10} {:<50} {:<12} {:<12}",
-        "IRQ", "Δ/s", "Device", "Affinity", "Effective Affinity"
+        "{:<8} {:<10} {:<12} {:<12} {:<80}",
+        "IRQ", "Δ/s", "Affinity", "EAffinity", "Device"
     );
     println!("{}", "-".repeat(width as usize));
 
@@ -203,8 +203,8 @@ fn show_combined_stats(deltas: &HashMap<String, u64>) {
         let affinity = affinity_map.get(irq_str).cloned().unwrap_or("N/A".to_string());
         let effective_affinity = effective_affinity_map.get(irq_str).cloned().unwrap_or("N/A".to_string());
         println!(
-            "{:<8} {:<10} {:<50} {:<12} {:<12}",
-            irq_str, delta, stats.name, affinity, effective_affinity
+            "{:<8} {:<10} {:<12} {:<12} {:<80}",
+            irq_str, delta, affinity, effective_affinity, stats.name, 
         );
     }
 }
