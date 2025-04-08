@@ -235,8 +235,6 @@ fn show_cpu_stats(irq_name: &str) -> Result<()> {
 
     println!("\x1B[2J\x1B[H");
     println!("CPU Delta Statistics for {}:", irq_name);
-    println!("{:<8} {:<16}", "CPU", "Δ/s");
-
     let counts_len = curr_stats.counts.len();
     let deltas: Vec<_> = deltas.unwrap_or_else(|| vec![0; counts_len])        .into_iter()
         .enumerate()
@@ -248,8 +246,6 @@ fn show_cpu_stats(irq_name: &str) -> Result<()> {
     let num_columns = (deltas.len() as f32 / max_cpu_per_col as f32).ceil() as usize;
     let col_width = 20; // 8 for "CPU" column
     
-    // Print header
-    println!("\nInterrupt: {:<8}", irq_name);
     for col in 0..num_columns {
         print!("{:<width$}", format!("Δ/s (Col {})", col+1), width = col_width);
     }
