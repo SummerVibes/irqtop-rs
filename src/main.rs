@@ -12,7 +12,7 @@ struct IrqStats {
     name: String,
 }
 
-/// Paurse command-line arguments
+/// Parse command-line arguments
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
