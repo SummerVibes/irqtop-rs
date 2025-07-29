@@ -47,12 +47,17 @@ enum Commands {
 /// Application state
 struct App {
     irq_data: HashMap<String, IrqStats>,
+    prev_irq_data: HashMap<String, IrqStats>,
     deltas: Vec<(String, u64)>,
+    per_cpu_deltas: HashMap<String, Vec<u64>>,
     affinity_map: HashMap<String, String>,
     effective_affinity_map: HashMap<String, String>,
     selected_row: usize,
     sort_by: SortBy,
     show_help: bool,
+    show_irq_detail: bool,
+    detail_irq_name: Option<String>,
+    detail_scroll_offset: usize,
     running: bool,
     last_update: Instant,
 }
@@ -70,17 +75,24 @@ impl Default for App {
     fn default() -> Self {
         Self {
             irq_data: HashMap::new(),
+            prev_irq_data: HashMap::new(),
             deltas: Vec::new(),
+            per_cpu_deltas: HashMap::new(),
             affinity_map: HashMap::new(),
             effective_affinity_map: HashMap::new(),
             selected_row: 0,
             sort_by: SortBy::Delta,
             show_help: false,
+            show_irq_detail: false,
+            detail_irq_name: None,
+            detail_scroll_offset: 0,
             running: true,
             last_update: Instant::now(),
         }
     }
 }
+
+
 
 /// Optimized /proc/interrupts reader
 fn read_interrupts() -> Result<HashMap<String, IrqStats>> {
@@ -226,10 +238,27 @@ fn get_effective_affinity_map() -> HashMap<String, String> {
 }
 
 impl App {
-    fn update_data(&mut self) -> Result<()> {
+fn update_data(&mut self) -> Result<()> {
         let new_data = read_interrupts()?;
         let new_deltas = calculate_delta(&self.irq_data, &new_data);
         
+        // Calculate per-CPU deltas
+        self.per_cpu_deltas.clear();
+        for (irq, new_stats) in &new_data {
+            if let Some(old_stats) = self.prev_irq_data.get(irq) {
+                let deltas: Vec<u64> = new_stats.counts.iter()
+                    .zip(old_stats.counts.iter())
+                    .map(|(n, o)| n.saturating_sub(*o))
+                    .collect();
+                self.per_cpu_deltas.insert(irq.clone(), deltas);
+            } else {
+                // First time seeing this IRQ, use current counts as deltas
+                self.per_cpu_deltas.insert(irq.clone(), new_stats.counts.clone());
+            }
+        }
+        
+        // Update previous data
+        self.prev_irq_data = new_data.clone();
         self.irq_data = new_data;
         self.deltas = new_deltas;
         self.affinity_map = get_affinity_map();
@@ -297,7 +326,7 @@ fn run_app<B: Backend>(
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.running = false;
                     }
-KeyCode::Down => {
+                    KeyCode::Down => {
                         let max_row = app.deltas.len().saturating_sub(1);
                         if app.selected_row < max_row {
                             app.selected_row += 1;
@@ -328,6 +357,39 @@ KeyCode::Down => {
                     KeyCode::Char('h') | KeyCode::Char('H') => {
                         app.show_help = !app.show_help;
                     }
+                    KeyCode::Enter => {
+                        if !app.deltas.is_empty() && app.selected_row < app.deltas.len() {
+                            let (irq_name, _) = &app.deltas[app.selected_row];
+                            app.detail_irq_name = Some(irq_name.clone());
+                            app.show_irq_detail = true;
+                            app.detail_scroll_offset = 0;
+                        }
+                    }
+                    KeyCode::Esc => {
+                        app.show_irq_detail = false;
+                        app.detail_irq_name = None;
+                        app.detail_scroll_offset = 0;
+                    }
+                    KeyCode::Char('j') | KeyCode::Char('J') => {
+                        if app.show_irq_detail {
+                            app.detail_scroll_offset += 1;
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Char('K') => {
+                        if app.show_irq_detail {
+                            app.detail_scroll_offset = app.detail_scroll_offset.saturating_sub(1);
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        if app.show_irq_detail {
+                            app.detail_scroll_offset += 10;
+                        }
+                    }
+                    KeyCode::Char('u') | KeyCode::Char('U') => {
+                        if app.show_irq_detail {
+                            app.detail_scroll_offset = app.detail_scroll_offset.saturating_sub(10);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -349,6 +411,11 @@ KeyCode::Down => {
 
 fn ui(f: &mut Frame, app: &mut App) {
     let size = f.size();
+    
+    if app.show_irq_detail {
+        show_irq_detail(f, app);
+        return;
+    }
     
     if app.show_help {
         show_help(f);
@@ -397,7 +464,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         .bottom_margin(1);
 
     let default_str = "N/A";
-let rows: Vec<Row> = app
+    let rows: Vec<Row> = app
         .deltas
         .iter()
         .enumerate()
@@ -429,14 +496,14 @@ let rows: Vec<Row> = app
     f.render_widget(table, chunks[1]);
 
     // Footer
-    let footer = Paragraph::new("q: Quit | ↑/↓: Navigate | Tab: Sort | h: Help")
+    let footer = Paragraph::new("q: Quit | ↑/↓: Navigate | Tab: Sort | Enter: Detail | h: Help")
         .style(Style::default().fg(Color::Gray))
         .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(footer, chunks[2]);
 }
 
 fn show_help(f: &mut Frame) {
-    let help_text = "IRQTop Help\n\nNavigation:\n  ↑/↓     - Move selection up/down\n  PageUp  - Move up 10 rows\n  PageDown- Move down 10 rows\n  Home    - Go to first row\n  End     - Go to last row\n\nSorting:\n  Tab     - Cycle through sort options\n\nOther:\n  h       - Toggle this help screen\n  q       - Quit\n  Ctrl+C  - Force quit\n\nPress any key to close this help...";
+    let help_text = "IRQTop Help\n\nNavigation:\n  ↑/↓     - Move selection up/down\n  PageUp  - Move up 10 rows\n  PageDown- Move down 10 rows\n  Home    - Go to first row\n  End     - Go to last row\n\nSorting:\n  Tab     - Cycle through sort options\n\nDetail View:\n  Enter   - View selected IRQ details\n  Esc     - Return to main view\n  j/k     - Scroll down/up in detail view\n  d/u     - Scroll page down/up in detail view\n\nOther:\n  h       - Toggle this help screen\n  q       - Quit\n  Ctrl+C  - Force quit\n\nPress any key to close this help...";
 
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::White))
@@ -447,8 +514,126 @@ fn show_help(f: &mut Frame) {
                 .style(Style::default().fg(Color::Yellow)),
         );
 
-    let area = centered_rect(60, 20, f.size());
+    let area = centered_rect(60, 25, f.size());
     f.render_widget(help, area);
+}
+
+fn show_irq_detail(f: &mut Frame, app: &mut App) {
+    let size = f.size();
+    
+    if let Some(irq_name) = &app.detail_irq_name {
+        if let Some(stats) = app.irq_data.get(irq_name) {
+            // Find the delta for this IRQ
+            let delta_value = app.deltas.iter()
+                .find(|(name, _)| name == irq_name)
+                .map(|(_, delta)| *delta)
+                .unwrap_or(0);
+            
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                    Constraint::Length(2),
+                ])
+                .split(size);
+
+            // Header
+            let header = Paragraph::new(format!(
+                "IRQ Detail: {} ({}) | Total Δ: {} | Total CPUs: {} | Press Esc to return",
+                irq_name,
+                stats.name,
+                delta_value,
+                stats.counts.len()
+            ))
+            .style(Style::default().fg(Color::Cyan))
+            .block(Block::default().borders(Borders::ALL));
+            f.render_widget(header, chunks[0]);
+
+            // CPU stats table
+            let normal_style = Style::default().bg(Color::DarkGray);
+            
+            let header_cells = vec![
+                Cell::from("CPU"),
+                Cell::from("Δ"),
+                Cell::from("CPU"),
+                Cell::from("Δ"),
+                Cell::from("CPU"),
+                Cell::from("Δ"),
+                Cell::from("CPU"),
+                Cell::from("Δ"),
+            ];
+            let header = Row::new(header_cells)
+                .style(Style::default().fg(Color::Yellow))
+                .height(1)
+                .bottom_margin(1);
+
+            // Calculate visible rows and columns
+            let available_height = chunks[1].height.saturating_sub(2) as usize;
+            let rows_per_column = available_height.saturating_sub(1);
+            let total_cpus = stats.counts.len();
+            let cpus_per_row = 4;  // 4 CPUs per row
+            
+            let visible_rows = rows_per_column.min((total_cpus + cpus_per_row - 1) / cpus_per_row);
+            let max_scroll = (total_cpus + cpus_per_row - 1) / cpus_per_row;
+            let max_scroll = max_scroll.saturating_sub(visible_rows);
+            
+            // Clamp scroll offset
+            app.detail_scroll_offset = app.detail_scroll_offset.min(max_scroll);
+
+            // Get per-CPU deltas for this IRQ
+            let per_cpu_deltas = app.per_cpu_deltas.get(irq_name)
+                .unwrap_or(&stats.counts); // Fallback to counts if no deltas
+            
+            // Create rows for visible data
+            let mut rows = Vec::new();
+            for row_idx in 0..visible_rows {
+                let start_cpu = (app.detail_scroll_offset + row_idx) * cpus_per_row;
+                if start_cpu >= total_cpus {
+                    break;
+                }
+                
+                let mut cells = Vec::new();
+                for col in 0..cpus_per_row {
+                    let cpu_idx = start_cpu + col;
+                    if cpu_idx < total_cpus && cpu_idx < per_cpu_deltas.len() {
+                        cells.push(Cell::from(format!("CPU{}", cpu_idx)));
+                        cells.push(Cell::from(per_cpu_deltas[cpu_idx].to_string()));
+                    } else {
+                        cells.push(Cell::from(""));
+                        cells.push(Cell::from(""));
+                    }
+                }
+                
+                rows.push(Row::new(cells).style(normal_style));
+            }
+
+            let table = Table::new(rows, &[
+                Constraint::Length(6),  // CPU label
+                Constraint::Length(12), // Delta
+                Constraint::Length(6),  // CPU label
+                Constraint::Length(12), // Delta
+                Constraint::Length(6),  // CPU label
+                Constraint::Length(12), // Delta
+                Constraint::Length(6),  // CPU label
+                Constraint::Length(12), // Delta
+            ])
+                .header(header)
+                .block(Block::default().borders(Borders::ALL));
+
+            f.render_widget(table, chunks[1]);
+
+            // Footer with navigation help
+            let footer = Paragraph::new(format!(
+                "j/k: Scroll down/up | d/u: Page down/up | Scroll: {}/{} | Esc: Return",
+                app.detail_scroll_offset + 1,
+                max_scroll + 1
+            ))
+                .style(Style::default().fg(Color::Gray))
+                .alignment(ratatui::layout::Alignment::Center);
+            f.render_widget(footer, chunks[2]);
+        }
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
