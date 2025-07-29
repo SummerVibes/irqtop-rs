@@ -1,10 +1,24 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::{Backend, CrosstermBackend},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    Frame, Terminal,
+};
+
+use memchr;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
-use std::result::Result::Ok;
+use std::time::{Duration, Instant};
+
 /// Interrupt statistics
 #[derive(Debug, Default, Clone)]
 struct IrqStats {
@@ -16,8 +30,8 @@ struct IrqStats {
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Refresh interval in seconds
-    #[arg(short, long, default_value_t = 1)]
+    /// Refresh interval in milliseconds
+    #[arg(short, long, default_value_t = 1000)]
     interval: u64,
     
     #[command(subcommand)]
@@ -28,6 +42,44 @@ struct Cli {
 enum Commands {
     /// Show per cpu stats for a single IRQ
     Show { irq_name: String },
+}
+
+/// Application state
+struct App {
+    irq_data: HashMap<String, IrqStats>,
+    deltas: Vec<(String, u64)>,
+    affinity_map: HashMap<String, String>,
+    effective_affinity_map: HashMap<String, String>,
+    selected_row: usize,
+    sort_by: SortBy,
+    show_help: bool,
+    running: bool,
+    last_update: Instant,
+}
+
+#[derive(PartialEq, Eq)]
+enum SortBy {
+    Irq,
+    Delta,
+    Affinity,
+    EffectiveAffinity,
+    Device,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            irq_data: HashMap::new(),
+            deltas: Vec::new(),
+            affinity_map: HashMap::new(),
+            effective_affinity_map: HashMap::new(),
+            selected_row: 0,
+            sort_by: SortBy::Delta,
+            show_help: false,
+            running: true,
+            last_update: Instant::now(),
+        }
+    }
 }
 
 /// Optimized /proc/interrupts reader
@@ -122,15 +174,15 @@ fn read_interrupts() -> Result<HashMap<String, IrqStats>> {
     Ok(irq_map)
 }
 
-fn calculate_delta(old: &HashMap<String, IrqStats>, new: &HashMap<String, IrqStats>) -> HashMap<String, u64> {
-    let mut deltas = HashMap::new();
+fn calculate_delta(old: &HashMap<String, IrqStats>, new: &HashMap<String, IrqStats>) -> Vec<(String, u64)> {
+    let mut deltas = Vec::new();
     for (irq, new_stats) in new {
         if let Some(old_stats) = old.get(irq) {
             let delta: u64 = new_stats.counts.iter()
                 .zip(old_stats.counts.iter())
-                .map(|(n, o)| n - o)
+                .map(|(n, o)| n.saturating_sub(*o))
                 .sum();
-            deltas.insert(irq.clone(), delta);
+            deltas.push((irq.clone(), delta));
         }
     }
     deltas
@@ -173,97 +225,250 @@ fn get_effective_affinity_map() -> HashMap<String, String> {
     affinity_map
 }
 
-/// Display combined delta and affinity information
-fn show_combined_stats(deltas: &HashMap<String, u64>) {
-    print!("\x1B[?1049h");
-    let mut sorted: Vec<_> = deltas.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1));
+impl App {
+    fn update_data(&mut self) -> Result<()> {
+        let new_data = read_interrupts()?;
+        let new_deltas = calculate_delta(&self.irq_data, &new_data);
+        
+        self.irq_data = new_data;
+        self.deltas = new_deltas;
+        self.affinity_map = get_affinity_map();
+        self.effective_affinity_map = get_effective_affinity_map();
+        self.last_update = Instant::now();
+        
+        Ok(())
+    }
 
-    // Get terminal dimensions
-    let (width, height) = term_size::dimensions().unwrap_or((80, 120));
-    let max_rows = (height - 4).max(1); // Reserve 4 lines for headers
-    
-    print!("\x1B[0J");
-    println!("Real-time Interrupt Statistics with Affinity");
+    fn sort_data(&mut self) {
+        let default_str = "N/A";
+        
+        match self.sort_by {
+            SortBy::Irq => self.deltas.sort_by(|a, b| a.0.cmp(&b.0)),
+            SortBy::Delta => self.deltas.sort_by(|a, b| b.1.cmp(&a.1)),
+            SortBy::Affinity => self.deltas.sort_by(|a, b| {
+                let a_aff = self.affinity_map.get(&a.0).map(|s| s.as_str()).unwrap_or(default_str);
+                let b_aff = self.affinity_map.get(&b.0).map(|s| s.as_str()).unwrap_or(default_str);
+                a_aff.cmp(b_aff)
+            }),
+            SortBy::EffectiveAffinity => self.deltas.sort_by(|a, b| {
+                let a_aff = self.effective_affinity_map.get(&a.0).map(|s| s.as_str()).unwrap_or(default_str);
+                let b_aff = self.effective_affinity_map.get(&b.0).map(|s| s.as_str()).unwrap_or(default_str);
+                a_aff.cmp(b_aff)
+            }),
+            SortBy::Device => self.deltas.sort_by(|a, b| {
+                let a_dev = self.irq_data.get(&a.0).map(|s| s.name.as_str()).unwrap_or(default_str);
+                let b_dev = self.irq_data.get(&b.0).map(|s| s.name.as_str()).unwrap_or(default_str);
+                a_dev.cmp(b_dev)
+            }),
+        }
+    }
 
-    let interrupts = read_interrupts().unwrap();
-    let affinity_map = get_affinity_map();
-    let effective_affinity_map = get_effective_affinity_map();
-    // Create header, EAffinity means Effective Affinity
-    println!(
-        "{:<8} {:<10} {:<12} {:<12} {:<80}",
-        "IRQ", "Δ/s", "Affinity", "EAffinity", "Device"
-    );
-    println!("{}", "-".repeat(width as usize));
-
-    // Display rows with truncation based on terminal height
-    for (irq, delta) in sorted.iter().take(max_rows) {
-        let irq_str = irq.trim();
-        let stats = interrupts.get(irq_str).unwrap();
-        let affinity = affinity_map.get(irq_str).cloned().unwrap_or("N/A".to_string());
-        let effective_affinity = effective_affinity_map.get(irq_str).cloned().unwrap_or("N/A".to_string());
-        println!(
-            "{:<8} {:<10} {:<12} {:<12} {:<80}",
-            irq_str, delta, affinity, effective_affinity, stats.name, 
-        );
+    fn next_sort(&mut self) {
+        self.sort_by = match self.sort_by {
+            SortBy::Irq => SortBy::Delta,
+            SortBy::Delta => SortBy::Affinity,
+            SortBy::Affinity => SortBy::EffectiveAffinity,
+            SortBy::EffectiveAffinity => SortBy::Device,
+            SortBy::Device => SortBy::Irq,
+        };
     }
 }
 
-/// Display combined delta and affinity information
-fn show_cpu_stats(irq_name: &str) -> Result<()> {
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
+fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    mut app: App,
+    tick_rate: Duration,
+) -> Result<()> {
+    let mut last_tick = Instant::now();
     
-    static PREV_STATS: OnceLock<Mutex<Option<IrqStats>>> = OnceLock::new();
-    let prev_stats = PREV_STATS.get_or_init(|| Mutex::new(None));
-    
-    let curr_stats = read_interrupts()?.remove(irq_name)
-        .with_context(|| format!("IRQ {} not found", irq_name))?;
-    let cloned_stats = curr_stats.clone();
-    
-    let deltas = prev_stats.lock()
-        .unwrap()
-        .as_ref()
-        .map(|prev| {
-            cloned_stats.counts.iter()
-                .zip(prev.counts.iter())
-                .map(|(curr, prev)| curr - prev)
-                .collect::<Vec<u64>>()
-        });
+    loop {
+        terminal.draw(|f| ui(f, &mut app))?;
 
-    *prev_stats.lock().unwrap() = Some(cloned_stats);
+        let timeout = tick_rate
+            .checked_sub(last_tick.elapsed())
+            .unwrap_or_else(|| Duration::from_secs(0));
 
-    println!("\x1B[2J\x1B[H");
-    println!("CPU Delta Statistics for {}:", irq_name);
-    let counts_len = curr_stats.counts.len();
-    let deltas: Vec<_> = deltas.unwrap_or_else(|| vec![0; counts_len])        .into_iter()
-        .enumerate()
-        .collect();
-    
-    // Get terminal dimensions
-    let (term_width, term_height) = term_size::dimensions().unwrap_or((80, 24));
-    let max_cpu_per_col = (term_height - 4).max(1) as usize; // Reserve 4 lines for headers
-    let num_columns = (deltas.len() as f32 / max_cpu_per_col as f32).ceil() as usize;
-    let col_width = 20; // 8 for "CPU" column
-    
-    for col in 0..num_columns {
-        print!("{:<width$}", format!("Δ/s (Col {})", col+1), width = col_width);
-    }
-    println!("\n{}", "-".repeat(term_width as usize));
-
-    // Print CPU deltas in columns
-    for row in 0..max_cpu_per_col {
-        for col in 0..num_columns {
-            let idx = row + col * max_cpu_per_col;
-            if let Some((cpu, delta)) = deltas.get(idx) {
-                print!("{:<8} ", cpu);
-                print!("{:<width$}", delta, width = col_width-8);
+        if crossterm::event::poll(timeout)? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Char('Q') => {
+                        app.running = false;
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.running = false;
+                    }
+KeyCode::Down => {
+                        let max_row = app.deltas.len().saturating_sub(1);
+                        if app.selected_row < max_row {
+                            app.selected_row += 1;
+                        }
+                    }
+                    KeyCode::Up => {
+                        if app.selected_row > 0 {
+                            app.selected_row -= 1;
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        let max_row = app.deltas.len().saturating_sub(1);
+                        app.selected_row = (app.selected_row + 10).min(max_row);
+                    }
+                    KeyCode::PageUp => {
+                        app.selected_row = app.selected_row.saturating_sub(10);
+                    }
+                    KeyCode::Home => {
+                        app.selected_row = 0;
+                    }
+                    KeyCode::End => {
+                        app.selected_row = app.deltas.len().saturating_sub(1);
+                    }
+                    KeyCode::Tab => {
+                        app.next_sort();
+                        app.sort_data();
+                    }
+                    KeyCode::Char('h') | KeyCode::Char('H') => {
+                        app.show_help = !app.show_help;
+                    }
+                    _ => {}
+                }
             }
         }
-        println!();
+
+        if last_tick.elapsed() >= tick_rate {
+            app.update_data()?;
+            app.sort_data();
+            last_tick = Instant::now();
+        }
+
+        if !app.running {
+            break;
+        }
     }
-    
+
     Ok(())
+}
+
+fn ui(f: &mut Frame, app: &mut App) {
+    let size = f.size();
+    
+    if app.show_help {
+        show_help(f);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(size);
+
+    // Header
+    let header = Paragraph::new(format!(
+        "IRQTop v0.1.0 - Real-time Interrupt Statistics | Update: {:?} ago | Sort: {} | Press 'h' for help",
+        app.last_update.elapsed().as_millis(),
+        match app.sort_by {
+            SortBy::Irq => "IRQ",
+            SortBy::Delta => "Delta",
+            SortBy::Affinity => "Affinity",
+            SortBy::EffectiveAffinity => "Eff. Affinity",
+            SortBy::Device => "Device",
+        }
+    ))
+    .style(Style::default().fg(Color::Cyan))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(header, chunks[0]);
+
+    // Table
+    let selected_style = Style::default().add_modifier(Modifier::REVERSED);
+    let normal_style = Style::default().bg(Color::DarkGray);
+    
+    let header_cells = vec![
+        Cell::from("IRQ"),
+        Cell::from("Δ/s"),
+        Cell::from("Affinity"),
+        Cell::from("Eff. Affinity"),
+        Cell::from("Device"),
+    ];
+    let header = Row::new(header_cells)
+        .style(Style::default().fg(Color::Yellow))
+        .height(1)
+        .bottom_margin(1);
+
+    let default_str = "N/A";
+let rows: Vec<Row> = app
+        .deltas
+        .iter()
+        .enumerate()
+        .map(|(i, (irq, delta))| {
+            let stats = app.irq_data.get(irq).unwrap();
+            let affinity = app.affinity_map.get(irq).map(|s| s.as_str()).unwrap_or(default_str);
+            let effective_affinity = app.effective_affinity_map.get(irq).map(|s| s.as_str()).unwrap_or(default_str);
+            
+            let cells = vec![
+                Cell::from(irq.as_str()),
+                Cell::from(delta.to_string()),
+                Cell::from(affinity),
+                Cell::from(effective_affinity),
+                Cell::from(stats.name.as_str()),
+            ];
+            
+            if i == app.selected_row {
+                Row::new(cells).style(selected_style)
+            } else {
+                Row::new(cells).style(normal_style)
+            }
+        })
+        .collect();
+
+    let table = Table::new(rows, &[Constraint::Length(8), Constraint::Length(12), Constraint::Length(12), Constraint::Length(15), Constraint::Percentage(40)])
+        .header(header)
+        .block(Block::default().borders(Borders::ALL));
+
+    f.render_widget(table, chunks[1]);
+
+    // Footer
+    let footer = Paragraph::new("q: Quit | ↑/↓: Navigate | Tab: Sort | h: Help")
+        .style(Style::default().fg(Color::Gray))
+        .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(footer, chunks[2]);
+}
+
+fn show_help(f: &mut Frame) {
+    let help_text = "IRQTop Help\n\nNavigation:\n  ↑/↓     - Move selection up/down\n  PageUp  - Move up 10 rows\n  PageDown- Move down 10 rows\n  Home    - Go to first row\n  End     - Go to last row\n\nSorting:\n  Tab     - Cycle through sort options\n\nOther:\n  h       - Toggle this help screen\n  q       - Quit\n  Ctrl+C  - Force quit\n\nPress any key to close this help...";
+
+    let help = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .title("Help")
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::Yellow)),
+        );
+
+    let area = centered_rect(60, 20, f.size());
+    f.render_widget(help, area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
 
 fn main() -> Result<()> {
@@ -271,22 +476,95 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Show { irq_name }) => {
+            // For now, fall back to original behavior for show command
+            // In a future enhancement, we could add a detailed view
+            use std::sync::Mutex;
+            use std::sync::OnceLock;
+            
+            static PREV_STATS: OnceLock<Mutex<Option<IrqStats>>> = OnceLock::new();
+            let prev_stats = PREV_STATS.get_or_init(|| Mutex::new(None));
+            
             loop {
-                show_cpu_stats(&irq_name)?;
-                std::thread::sleep(Duration::from_secs(cli.interval));
+                let curr_stats = read_interrupts()?.remove(&irq_name)
+                    .with_context(|| format!("IRQ {} not found", irq_name))?;
+                let cloned_stats = curr_stats.clone();
+                
+                let deltas = prev_stats.lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|prev| {
+                        cloned_stats.counts.iter()
+                            .zip(prev.counts.iter())
+                            .map(|(curr, prev)| curr - prev)
+                            .collect::<Vec<u64>>()
+                    });
+
+                *prev_stats.lock().unwrap() = Some(cloned_stats);
+
+                println!("\x1B[2J\x1B[H");
+                println!("CPU Delta Statistics for {}:", irq_name);
+                let counts_len = curr_stats.counts.len();
+                let deltas: Vec<_> = deltas.unwrap_or_else(|| vec![0; counts_len])        
+                    .into_iter()
+                    .enumerate()
+                    .collect();
+                
+                // Get terminal dimensions
+                let (term_width, term_height) = term_size::dimensions().unwrap_or((80, 24));
+                let max_cpu_per_col = (term_height - 4).max(1) as usize; // Reserve 4 lines for headers
+                let num_columns = (deltas.len() as f32 / max_cpu_per_col as f32).ceil() as usize;
+                let col_width = 20; // 8 for "CPU" column
+                
+                for col in 0..num_columns {
+                    print!("{:<width$}", format!("Δ/s (Col {})", col+1), width = col_width);
+                }
+                println!("\n{}", "-".repeat(term_width as usize));
+
+                // Print CPU deltas in columns
+                for row in 0..max_cpu_per_col {
+                    for col in 0..num_columns {
+                        let idx = row + col * max_cpu_per_col;
+                        if let Some((cpu, delta)) = deltas.get(idx) {
+                            print!("{:<8} ", cpu);
+                            print!("{:<width$}", delta, width = col_width-8);
+                        }
+                    }
+                    println!();
+                }
+                
+                std::thread::sleep(Duration::from_millis(cli.interval));
             }
         }
         None => {
-            let mut prev_stats = read_interrupts()?;
-            loop {
-                // Update and display stats
-                let curr_stats = read_interrupts()?;
-                let deltas = calculate_delta(&prev_stats, &curr_stats);
-                show_combined_stats(&deltas);
-                prev_stats = curr_stats;
-                
-                std::thread::sleep(Duration::from_secs(cli.interval));
+            // Setup terminal
+            enable_raw_mode()?;
+            let mut stdout = std::io::stdout();
+            execute!(stdout, EnterAlternateScreen)?;
+            let backend = CrosstermBackend::new(stdout);
+            let mut terminal = Terminal::new(backend)?;
+
+            // Create app
+            let mut app = App::default();
+            app.update_data()?;
+            app.sort_data();
+
+            // Run app
+            let tick_rate = Duration::from_millis(cli.interval);
+            let res = run_app(&mut terminal, app, tick_rate);
+
+            // Restore terminal
+            disable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+            )?;
+            terminal.show_cursor()?;
+
+            if let Err(err) = res {
+                println!("Error: {:?}", err);
             }
         }
     }
+
+    Ok(())
 }
